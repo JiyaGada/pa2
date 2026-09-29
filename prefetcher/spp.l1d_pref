@@ -1,15 +1,193 @@
 #include "cache.h"
 
+#define IP_TABLE_ENTRIES 128
+#define PHT_ENTRIES 256
+#define PAGE_SIZE 4096
+#define MAX_DEGREE 4
+#define MIN_DEGREE 1
+#define UNIFORM_CONF_THRESH 2
+#define ACCURACY_EVAL_WINDOW 100
+
+
+struct IP_Tracker {
+    uint64_t ip;
+    uint64_t last_addr;
+    int64_t last_stride;
+    int uniform_conf;
+    uint32_t signature; // Hashed sequence of recent strides
+    uint64_t lru_cycle;
+};
+
+struct Pattern_Entry {
+    uint32_t signature;
+    int64_t next_stride;
+    uint64_t lru_cycle;
+};
+
+IP_Tracker ip_table[NUM_CPUS][IP_TABLE_ENTRIES];
+Pattern_Entry pattern_table[NUM_CPUS][PHT_ENTRIES];
+
+uint64_t prefetches_issued[NUM_CPUS];
+uint64_t prefetches_useful[NUM_CPUS];
+int current_degree[NUM_CPUS];
+
+const int TRACKER_SIZE = 64;
+uint64_t recent_prefetches[NUM_CPUS][TRACKER_SIZE];
+int rp_head[NUM_CPUS];
+
+uint32_t update_signature(uint32_t old_sig, int64_t stride) {
+    return ((old_sig << 3) ^ (stride & 0xFFF)) & 0xFFFF; // 16-bit signature
+}
+
+bool same_page(uint64_t addr1, uint64_t addr2) {
+    return (addr1 >> 12) == (addr2 >> 12);
+}
+
+void record_prefetch(uint32_t cpu, uint64_t addr) {
+    recent_prefetches[cpu][rp_head[cpu]] = addr >> 6; // store cache line address
+    rp_head[cpu] = (rp_head[cpu] + 1) % TRACKER_SIZE;
+}
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i=0;i<NUM_CPUS;i++){
+       for (int j=0;j<IP_TABLE_ENTRIES;j++){
+        ip_table[i][j].ip=0;
+        ip_table[i][j].lru_cycle=0;
+        ip_table[i][j].uniform_conf=0;
+       } 
+       for (int j=0;j<PHT_ENTRIES;j++){
+        pattern_table[i][j].signature=0;
+        pattern_table[i][j].lru_cycle=0;
+       }
+       prefetches_issued[i]=0;
+       prefetches_useful[i]=0;
+       current_degree[i]=2;
+       rp_head[i]=0;
+       for (int j=0;j<TRACKER_SIZE;j++){
+        recent_prefetches[i][j]=0;
+       }
+    }
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
+{   uint32_t cpu = this->cpu;
+    uint64_t current_cycle = current_core_cycle[cpu];
+    uint64_t cl_addr = addr >> 6;
+
+    for (int i = 0; i < TRACKER_SIZE; i++) {
+        if (recent_prefetches[cpu][i] == cl_addr) {
+            prefetches_useful[cpu]++;
+            recent_prefetches[cpu][i] = 0; // Clear to avoid double counting
+            break;
+        }
+    }
+
+    if (prefetches_issued[cpu] >= ACCURACY_EVAL_WINDOW) {
+        double accuracy = (double)prefetches_useful[cpu] / prefetches_issued[cpu];
+        if (accuracy > 0.75 && current_degree[cpu] < MAX_DEGREE) {
+            current_degree[cpu]++;
+        } else if (accuracy < 0.40 && current_degree[cpu] > MIN_DEGREE) {
+            current_degree[cpu]--;
+        }
+        prefetches_issued[cpu] = 0;
+        prefetches_useful[cpu] = 0;
+    }
+
+    int ip_idx = -1;
+    int lru_ip_idx = 0;
+    for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+        if (ip_table[cpu][i].ip == ip) {
+            ip_idx = i;
+            break;
+        }
+        if (ip_table[cpu][i].lru_cycle < ip_table[cpu][lru_ip_idx].lru_cycle) {
+            lru_ip_idx = i;
+        }
+    }
+
+    if (ip_idx == -1) {
+        // IP not found, allocate new entry
+        ip_idx = lru_ip_idx;
+        ip_table[cpu][ip_idx].ip = ip;
+        ip_table[cpu][ip_idx].last_addr = addr;
+        ip_table[cpu][ip_idx].last_stride = 0;
+        ip_table[cpu][ip_idx].uniform_conf = 0;
+        ip_table[cpu][ip_idx].signature = 0;
+        ip_table[cpu][ip_idx].lru_cycle = current_cycle;
+        return; // Need more history to establish a pattern
+    }
+
+    ip_table[cpu][ip_idx].lru_cycle = current_cycle;
+    int64_t current_stride = addr - ip_table[cpu][ip_idx].last_addr;
+    
+    if (current_stride == 0) return;
+
+    uint32_t old_sig = ip_table[cpu][ip_idx].signature;
+    int pht_idx = -1, lru_pht_idx = 0;
+    for (int i = 0; i < PHT_ENTRIES; i++) {
+        if (pattern_table[cpu][i].signature == old_sig) {
+            pht_idx = i;
+            break;
+        }
+        if (pattern_table[cpu][i].lru_cycle < pattern_table[cpu][lru_pht_idx].lru_cycle) {
+            lru_pht_idx = i;
+        }
+    }
+    
+    if (pht_idx == -1) pht_idx = lru_pht_idx;
+    pattern_table[cpu][pht_idx].signature = old_sig;
+    pattern_table[cpu][pht_idx].next_stride = current_stride;
+    pattern_table[cpu][pht_idx].lru_cycle = current_cycle;
+
+    if (current_stride == ip_table[cpu][ip_idx].last_stride) {
+        if (ip_table[cpu][ip_idx].uniform_conf < 3) ip_table[cpu][ip_idx].uniform_conf++;
+    } else {
+        if (ip_table[cpu][ip_idx].uniform_conf > 0) ip_table[cpu][ip_idx].uniform_conf--;
+    }
+
+    ip_table[cpu][ip_idx].last_stride = current_stride;
+    ip_table[cpu][ip_idx].last_addr = addr;
+    ip_table[cpu][ip_idx].signature = update_signature(old_sig, current_stride);
+
+    uint64_t pf_addr = addr;
+    uint32_t speculative_sig = ip_table[cpu][ip_idx].signature;
+    
+    for (int d = 1; d <= current_degree[cpu]; d++) {
+        int64_t pred_stride = 0;
+
+        if (ip_table[cpu][ip_idx].uniform_conf >= UNIFORM_CONF_THRESH) {
+            pred_stride = ip_table[cpu][ip_idx].last_stride;
+        } 
+        else {
+            bool found_pattern = false;
+            for (int i = 0; i < PHT_ENTRIES; i++) {
+                if (pattern_table[cpu][i].signature == speculative_sig) {
+                    pred_stride = pattern_table[cpu][i].next_stride;
+                    found_pattern = true;
+                    pattern_table[cpu][i].lru_cycle = current_cycle;
+                    break;
+                }
+            }
+            if (!found_pattern || pred_stride == 0) break; 
+            
+            speculative_sig = update_signature(speculative_sig, pred_stride);
+        }
+
+        pf_addr += pred_stride;
+
+        if (!same_page(addr, pf_addr)) break;
+
+        int success = prefetch_line(ip, addr, pf_addr, 1, 0); 
+        if (success) {
+            prefetches_issued[cpu]++;
+            record_prefetch(cpu, pf_addr);
+        }
+    }
    
 }
 
