@@ -1,3 +1,6 @@
 traces/
 bin/
 obj/
+raw/
+.idea/
+.vscode/
