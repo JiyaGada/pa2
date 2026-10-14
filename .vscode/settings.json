@@ -1,3 +1,9 @@
 {
-    "makefile.configureOnOpen": true
+    "makefile.configureOnOpen": true,
+    "chat.tools.terminal.autoApprove": {
+        "/^\\./bin/hashed_perceptron-no-spp-no-no-no-no-no-lru-lru-lru-lru-lru-lru-lru-lru-1core-task1_check -warmup_instructions 1000000 -simulation_instructions 1000000 -traces traces/Trace1\\.gz \\| tail -n 100$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
 }
