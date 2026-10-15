@@ -6,16 +6,23 @@ The table below reports the values obtained for the three traces.
 
 | Trace | IPC with Prefetcher | Speedup | L1D Load MPKI | Prefetch Accuracy | Coverage |
 |---|---:|---:|---:|---:|---:|
-| Trace1.gz | 0.233905 | 1.00772x | 9.67296 | 62.0624% | 9.42% |
-| Trace2.gz | 0.252287 | 1.00922x | 13.0896 | 56.0276% | 3.31% |
-| Trace3.gz | 0.384573 | 1.00708x | 3.108 | 34.234% | 8.68% |
+| Trace1.gz | 0.233918 | 1.00778x | 9.67160 | 62.0792% | 9.43% |
+| Trace2.gz | 0.252293 | 1.00924x | 13.08920 | 56.0933% | 3.31% |
+| Trace3.gz | 0.384546 | 1.00701x | 3.10912 | 34.1697% | 8.65% |
 
-The corresponding plots are stored in [results/task1/plots](plots):
+The SPP metrics were collected by rerunning the prefetcher on all three traces.
 
-- speedup.png
-- l1d_mpki.png
-- accuracy.png
-- coverage.png
+### Speedup
+![SPP speedup across traces](plots/speedup.png)
+
+### L1D load MPKI
+![Baseline and SPP L1D load MPKI across traces](plots/l1d_mpki.png)
+
+### Prefetch accuracy
+![SPP prefetch accuracy across traces](plots/accuracy.png)
+
+### Coverage
+![L1D load miss coverage across traces](plots/coverage.png)
 
 ## 2) Storage overhead of the prefetcher
 
@@ -28,43 +35,45 @@ Each entry of `IP_Tracker` contains:
 - `last_addr` = 64 bits
 - `last_stride` = 64 bits
 - `uniform_conf` = 32 bits
-- `signature` = 32 bits
-- `lru_cycle` = 64 bits
+- `signature` = 16 bits
+- `lru_rank` = 8 bits
 
-Per-entry size:
+Logical field width:
 
-- 64 + 64 + 64 + 32 + 32 + 64 = 320 bits
+- 64 + 64 + 64 + 32 + 16 + 8 = 248 bits
 
 There are 128 entries:
 
-- 128 × 320 = 40,960 bits
+- 128 × 248 = 31,744 bits
 
 ### Pattern table
 Each entry of `Pattern_Entry` contains:
 
-- `signature` = 32 bits
+- `signature` = 16 bits
 - `next_stride` = 64 bits
-- `lru_cycle` = 64 bits
+- `lru_rank` = 8 bits
 
-Per-entry size:
+Logical field width:
 
-- 32 + 64 + 64 = 160 bits
+- 16 + 64 + 8 = 88 bits
 
 There are 256 entries:
 
-- 256 × 160 = 40,960 bits
+- 256 × 88 = 22,528 bits
+
+LRU uses stack ranks: rank 0 is most recently used, and the largest rank is selected for eviction. Each rank field is `uint8_t`; the 256-entry pattern table uses ranks 0 through 255.
 
 ### Total storage overhead
 
-- IP tracker table: 40,960 bits
-- Pattern table: 40,960 bits
+- IP tracker table: 31,744 logical bits
+- Pattern table: 22,528 logical bits
 - Prefetch tracking array: 64 × 64 = 4,096 bits
 
-Total per core:
+Total logical field storage per core:
 
-- 40,960 + 40,960 + 4,096 = 86,016 bits
+- 31,744 + 22,528 + 4,096 = 58,368 bits (7,296 bytes)
 
-This is the storage used by the prefetcher metadata tables.
+These logical bit counts exclude C++ struct padding. With the current field order and typical 8-byte alignment, `sizeof(IP_Tracker)` is 32 bytes and `sizeof(Pattern_Entry)` is 24 bytes; including the 4,096-byte IP table, 6,144-byte pattern table, and 512-byte prefetch tracking array, the allocated arrays occupy about 10,752 bytes per core.
 
 ## 3) Threshold for accuracy throttling
 

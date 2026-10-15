@@ -14,14 +14,14 @@ struct IP_Tracker {
     uint64_t last_addr;
     int64_t last_stride;
     int uniform_conf;
-    uint32_t signature; // Hashed sequence of recent strides
-    uint64_t lru_cycle;
+    uint16_t signature; // Hashed sequence of recent strides
+    uint8_t lru_rank;
 };
 
 struct Pattern_Entry {
-    uint32_t signature;
+    uint16_t signature;
     int64_t next_stride;
-    uint64_t lru_cycle;
+    uint8_t lru_rank;
 };
 
 IP_Tracker ip_table[NUM_CPUS][IP_TABLE_ENTRIES];
@@ -35,8 +35,8 @@ const int TRACKER_SIZE = 64;
 uint64_t recent_prefetches[NUM_CPUS][TRACKER_SIZE];
 int rp_head[NUM_CPUS];
 
-uint32_t update_signature(uint32_t old_sig, int64_t stride) {
-    return ((old_sig << 3) ^ (stride & 0xFFF)) & 0xFFFF; // 16-bit signature
+uint16_t update_signature(uint16_t old_sig, int64_t stride) {
+    return ((old_sig << 3) ^ (stride & 0xFFF)) & 0xFFFF;
 }
 
 bool same_page(uint64_t addr1, uint64_t addr2) {
@@ -48,6 +48,24 @@ void record_prefetch(uint32_t cpu, uint64_t addr) {
     rp_head[cpu] = (rp_head[cpu] + 1) % TRACKER_SIZE;
 }
 
+void touch_ip_tracker(uint32_t cpu, int index) {
+    uint8_t rank = ip_table[cpu][index].lru_rank;
+    for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+        if (ip_table[cpu][i].lru_rank < rank)
+            ip_table[cpu][i].lru_rank++;
+    }
+    ip_table[cpu][index].lru_rank = 0;
+}
+
+void touch_pattern_entry(uint32_t cpu, int index) {
+    uint8_t rank = pattern_table[cpu][index].lru_rank;
+    for (int i = 0; i < PHT_ENTRIES; i++) {
+        if (pattern_table[cpu][i].lru_rank < rank)
+            pattern_table[cpu][i].lru_rank++;
+    }
+    pattern_table[cpu][index].lru_rank = 0;
+}
+
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
@@ -57,12 +75,12 @@ void CACHE::l1d_prefetcher_initialize()
     for (int i=0;i<NUM_CPUS;i++){
        for (int j=0;j<IP_TABLE_ENTRIES;j++){
         ip_table[i][j].ip=0;
-        ip_table[i][j].lru_cycle=0;
+        ip_table[i][j].lru_rank=j;
         ip_table[i][j].uniform_conf=0;
        } 
        for (int j=0;j<PHT_ENTRIES;j++){
         pattern_table[i][j].signature=0;
-        pattern_table[i][j].lru_cycle=0;
+        pattern_table[i][j].lru_rank=j;
        }
        prefetches_issued[i]=0;
        prefetches_useful[i]=0;
@@ -76,7 +94,6 @@ void CACHE::l1d_prefetcher_initialize()
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {   uint32_t cpu = this->cpu;
-    uint64_t current_cycle = current_core_cycle[cpu];
     uint64_t cl_addr = addr >> 6;
 
     for (int i = 0; i < TRACKER_SIZE; i++) {
@@ -105,7 +122,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             ip_idx = i;
             break;
         }
-        if (ip_table[cpu][i].lru_cycle < ip_table[cpu][lru_ip_idx].lru_cycle) {
+        if (ip_table[cpu][i].lru_rank > ip_table[cpu][lru_ip_idx].lru_rank) {
             lru_ip_idx = i;
         }
     }
@@ -118,23 +135,23 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         ip_table[cpu][ip_idx].last_stride = 0;
         ip_table[cpu][ip_idx].uniform_conf = 0;
         ip_table[cpu][ip_idx].signature = 0;
-        ip_table[cpu][ip_idx].lru_cycle = current_cycle;
+        touch_ip_tracker(cpu, ip_idx);
         return; // Need more history to establish a pattern
     }
 
-    ip_table[cpu][ip_idx].lru_cycle = current_cycle;
+    touch_ip_tracker(cpu, ip_idx);
     int64_t current_stride = addr - ip_table[cpu][ip_idx].last_addr;
     
     if (current_stride == 0) return;
 
-    uint32_t old_sig = ip_table[cpu][ip_idx].signature;
+    uint16_t old_sig = ip_table[cpu][ip_idx].signature;
     int pht_idx = -1, lru_pht_idx = 0;
     for (int i = 0; i < PHT_ENTRIES; i++) {
         if (pattern_table[cpu][i].signature == old_sig) {
             pht_idx = i;
             break;
         }
-        if (pattern_table[cpu][i].lru_cycle < pattern_table[cpu][lru_pht_idx].lru_cycle) {
+        if (pattern_table[cpu][i].lru_rank > pattern_table[cpu][lru_pht_idx].lru_rank) {
             lru_pht_idx = i;
         }
     }
@@ -142,7 +159,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (pht_idx == -1) pht_idx = lru_pht_idx;
     pattern_table[cpu][pht_idx].signature = old_sig;
     pattern_table[cpu][pht_idx].next_stride = current_stride;
-    pattern_table[cpu][pht_idx].lru_cycle = current_cycle;
+    touch_pattern_entry(cpu, pht_idx);
 
     if (current_stride == ip_table[cpu][ip_idx].last_stride) {
         if (ip_table[cpu][ip_idx].uniform_conf < 3) ip_table[cpu][ip_idx].uniform_conf++;
@@ -155,7 +172,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     ip_table[cpu][ip_idx].signature = update_signature(old_sig, current_stride);
 
     uint64_t pf_addr = addr;
-    uint32_t speculative_sig = ip_table[cpu][ip_idx].signature;
+    uint16_t speculative_sig = ip_table[cpu][ip_idx].signature;
     
     for (int d = 1; d <= current_degree[cpu]; d++) {
         int64_t pred_stride = 0;
@@ -169,7 +186,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                 if (pattern_table[cpu][i].signature == speculative_sig) {
                     pred_stride = pattern_table[cpu][i].next_stride;
                     found_pattern = true;
-                    pattern_table[cpu][i].lru_cycle = current_cycle;
+                    touch_pattern_entry(cpu, i);
                     break;
                 }
             }
