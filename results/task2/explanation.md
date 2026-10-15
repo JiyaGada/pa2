@@ -52,3 +52,7 @@ The measurements used a single core, with 25 million warmup instructions and 25 
 - `speedup.png`: IPC gain over RRIP, shown as a percentage so small gains are visible.
 - `load_mpki.png`: absolute L2 total load, instruction-load, and data-load MPKI. Axes are zoomed by trace and metric, and values are labeled.
 - `data.csv`: all plotted and tabulated measurements
+
+The DIRRIP numbers above come from `replacement/dyn_irrip_task2.l2c_repl`. That file is the
+Task 2 policy, kept unchanged, because `replacement/dyn_irrip.l2c_repl` now carries the
+prefetch-aware Task 3 version.
